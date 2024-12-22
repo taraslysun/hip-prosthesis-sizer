@@ -5,3 +5,7 @@ __pycache__/
 dataset_*/
 weights/
 *.zip
+
+results/
+heap-dataset/
+*.csv
