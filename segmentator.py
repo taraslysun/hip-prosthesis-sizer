@@ -5,6 +5,7 @@ import numpy as np
 import os
 import dotenv
 from inference_sdk import InferenceHTTPClient
+from detector import Detector
 
 class Segmentator:
     def __init__(self, model_path):
@@ -32,7 +33,6 @@ class Segmentator:
         cv2.imwrite(save_path, image)
 
 
-
 class HeadSegmentator:
     def __init__(self, model_id):
         self.model_id = model_id
@@ -58,8 +58,6 @@ class HeadSegmentator:
 
     def save_image(self, image, save_path):
         cv2.imwrite(save_path, image)
-
-
 
 
 def find_tangent_lines(image_path, segmentation_results, detection_results):
@@ -92,9 +90,9 @@ def find_tangent_lines(image_path, segmentation_results, detection_results):
 
     left_hole = min(small_holes, key=lambda x: x[0][0])
     right_hole = max(small_holes, key=lambda x: x[0][0])
-    left_hole_top_left, left_hole_top_right = left_hole
-    right_hole_top_left, right_hole_top_right = right_hole
-
+    
+    left_hole_top_left, _ = left_hole
+    _, right_hole_top_right = right_hole
 
     def line_intersects_contour(point1, point2, contour):
         mask_line = np.zeros(image.shape[:2], dtype=np.uint8)
@@ -115,8 +113,8 @@ def find_tangent_lines(image_path, segmentation_results, detection_results):
         new_point = (left_hole_top_left[0] + x_offset, left_hole_top_left[1] - y_offset)
         if line_intersects_contour(left_hole_top_left, new_point, green_contour):
             new_points.append(new_point)
+
             left_line_points = (left_hole_top_left, new_point)
-            print(left_line_points, "left")
             cv2.line(image, left_hole_top_left, new_point, (255, 0, 0), 2)
             break
 
@@ -133,36 +131,123 @@ def find_tangent_lines(image_path, segmentation_results, detection_results):
             cv2.line(image, right_hole_top_right, new_point, (0, 255, 0), 2)
             break
 
-    return image, left_line_points, right_line_points, left_hole_top_left, right_hole_top_right, new_points
+    res = {
+        'image': image,
+        'left_line_points': left_line_points,
+        'right_line_points': right_line_points,
+        'left_hole_top_left': left_hole_top_left,
+        'right_hole_top_right': right_hole_top_right,
+        'new_points': new_points
+    }
+
+    return res
 
 
 def get_head_edge_points(head_segm_results):
     res = []
-    for points in head_segm_results:
-        max_left = sorted([point for point in points['points']], key=lambda x: x['x'])[-1]
-        max_right = sorted([point for point in points['points']], key=lambda x: x['x'])[0]
-        res.append((max_left, max_right))
-    return res
+    for result in head_segm_results:
+        for point in result['points']:
+            res.append((point['x'], point['y']))
+    max_right = max(res, key=lambda x: x[0])
+    max_left = min(res, key=lambda x: x[0])
+    return max_left, max_right
 
 
-def px_in_cm(det_results):
+def px_in_cm(det_results, offset=0.8):
     pixels = None
     for res in det_results:
         if res['class'] == 'scale-mark':
             pixels = res['width']
             break
-    return pixels * 0.69
+    return pixels * offset
 
 
 
-def get_head_highest_points(head_segm_results, cm):
+def get_head_highest_points(head_segm_results, cm, offset=0.5):
     res = []
     for result in head_segm_results:
         highest_point = min(result['points'], key=lambda x: x['y'])
-        print(highest_point)
-        res.append((highest_point['x'], highest_point['y']-0.5*cm))
+        res.append((highest_point['x'], highest_point['y']-offset*cm))
+    
+    left_highest = min(res, key=lambda x: x[0])
+    right_highest = max(res, key=lambda x: x[0])
+    return left_highest, right_highest
 
-    return res
+def get_tang_points(L_highest_point, R_highest_point, L_right_highest_point, R_left_highest_point, L_hole_top_left, R_hole_top_right):
+    x0_left, y0_left = L_right_highest_point[0], L_right_highest_point[1]
+    x1_left, y1_left = L_hole_top_left[0], L_hole_top_left[1]
+    y_left = L_highest_point[1]
+
+    x_intersection_left = x0_left + ((y_left - y0_left) * (x1_left - x0_left)) / (y1_left - y0_left)
+    
+    x0_right, y0_right = R_left_highest_point[0], R_left_highest_point[1]
+    x1_right, y1_right = R_hole_top_right[0], R_hole_top_right[1]
+    y_right = R_highest_point[1]
+
+    x_intersection_right = x0_right + ((y_right - y0_right) * (x1_right - x0_right)) / (y1_right - y0_right)
+
+    L_right_top = (int(x_intersection_left), int(y_left))
+    R_left_top = (int(x_intersection_right), int(y_right))
+
+    return L_right_top, R_left_top
+
+
+def get_keypoints(image_path, segm_model, head_segm_model, det_model):
+    segm = Segmentator(model_path=segm_model)
+    head_segm = HeadSegmentator(model_id=head_segm_model)
+    det = Detector(model_id=det_model)
+
+    segm_results = segm.segment(image_path)
+    head_segm_results = head_segm.segment(image_path)
+    det_results = det.detect(image_path)
+
+    img = cv2.imread(image_path)
+
+    tang_dict = find_tangent_lines(image_path, segm_results, det_results)
+    cm = px_in_cm(det_results)
+
+    new_points = tang_dict['new_points']
+    L_hole_top_left = tang_dict['left_hole_top_left']
+    R_hole_top_right = tang_dict['right_hole_top_right']
+
+    L_edge_point, R_edge_point = get_head_edge_points(head_segm_results)
+    L_highest_point, R_highest_point = get_head_highest_points(head_segm_results, cm)
+    L_right_highest_point = new_points[0]
+    R_left_highest_point = new_points[1]
+
+    L_left_top = (int(L_edge_point[0]), int(L_highest_point[1]))
+    L_left_bottom = (int(L_edge_point[0]), int(L_hole_top_left[1]))
+    L_right_bottom = (int(L_hole_top_left[0]), int(L_hole_top_left[1]))
+
+
+    R_right_top = (int(R_edge_point[0]), int(R_highest_point[1]))
+    R_right_bottom = (int(R_edge_point[0]), int(R_hole_top_right[1]))
+    R_left_bottom = (int(R_hole_top_right[0]), int(R_hole_top_right[1]))
+
+    L_right_top, R_left_top = get_tang_points(L_highest_point, 
+                                              R_highest_point, 
+                                              L_right_highest_point, 
+                                              R_left_highest_point, 
+                                              L_hole_top_left, 
+                                              R_hole_top_right)
+
+
+
+    return img, {
+        'L_edge_point': L_edge_point,
+        'R_edge_point': R_edge_point,
+        'L_highest_point': L_highest_point,
+        'R_highest_point': R_highest_point,
+        'L_left_top': L_left_top,
+        'L_left_bottom': L_left_bottom,
+        'L_right_top': L_right_top,
+        'L_right_bottom': L_right_bottom,
+        'R_right_top': R_right_top,
+        'R_right_bottom': R_right_bottom,
+        'R_left_top': R_left_top,
+        'R_left_bottom': R_left_bottom,
+        'cm': cm
+    }
 
 
 if __name__ == "__main__":
