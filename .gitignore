@@ -1,9 +1,8 @@
-venv/
+*venv/
 __pycache__/
 .env
 
 dataset_*/
-weights/
 *.zip
 
 results/
